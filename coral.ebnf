@@ -1,0 +1,145 @@
+coral_script = { top_level_statement } , EOF ;
+
+top_level_statement = definition | statement ;
+
+definition = function_definition | object_definition | store_definition | module_definition ;
+
+statement = assignment
+          | expression_statement
+          | conditional_statement
+          | loop_statement
+          | use_statement
+          | return_statement
+          | empty_statement
+          ;
+
+empty_statement = NEWLINE ;
+
+assignment = assignable_target , 'is' , ( expression | map_block_assignment_rhs ) ;
+
+assignable_target = primary_expression_base , { property_access_suffix | list_element_access_suffix } ;
+
+expression_statement = full_expression ;
+
+return_statement = 'return' , [ expression ] ;
+
+full_expression = expression , [ error_handler_suffix ] ;
+
+expression = ternary_conditional_expression ;
+
+ternary_conditional_expression = logical_or_expression , [ '?' , expression , '!' , expression ] ;
+
+logical_or_expression = logical_and_expression , { 'or' , logical_and_expression } ;
+
+logical_and_expression = comparison_expression , { 'and' , comparison_expression } ;
+
+comparison_expression = additive_expression , { ( '=' | 'equals' | '>' | '>=' | '<' | '<=' ) , additive_expression } ;
+
+additive_expression = multiplicative_expression , { ( '+' | '-' ) , multiplicative_expression } ;
+
+multiplicative_expression = unary_expression , { ( '*' | '/' | '%' ) , unary_expression } ;
+
+unary_expression = [ '-' | 'not' ] , value_or_invocation ;
+
+value_or_invocation = primary_expression_base , { property_access_suffix | list_element_access_suffix } , [ call_operation ] ;
+
+primary_expression_base = IDENTIFIER
+                        | literal
+                        | DOLLAR_PARAM
+                        | list_literal
+                        | map_literal
+                        | '(' , expression , ')'
+                        ;
+
+property_access_suffix = '.' , IDENTIFIER ;
+list_element_access_suffix = '(' , expression , ')' ;
+
+call_operation =
+    ( '.' , ( IDENTIFIER | 'across' ) , [ arguments ] )
+  | ( IDENTIFIER , [ arguments_for_no_dot_call ] )
+  | ( arguments_for_direct_call )
+  ;
+
+arguments = paren_argument_list | no_paren_space_separated_argument_list | empty_argument_indicator ;
+arguments_for_no_dot_call = paren_argument_list | no_paren_space_separated_argument_list | empty_argument_indicator ;
+arguments_for_direct_call = paren_argument_list | no_paren_comma_separated_argument_list | empty_argument_indicator ;
+
+paren_argument_list = '(' , [ argument_list ] , ')' ;
+empty_argument_indicator = (* empty *) ;
+
+argument_list = argument , { ',' , argument } ;
+argument = [ IDENTIFIER , ':' ] , expression ;
+
+no_paren_space_separated_argument_list = expression_for_no_paren_call , { expression_for_no_paren_call } ;
+no_paren_comma_separated_argument_list = expression_for_no_paren_call , { ',' , expression_for_no_paren_call } ;
+
+expression_for_no_paren_call = primary_expression_base | additive_expression ;
+
+literal = STRING_LITERAL | INTEGER_LITERAL | FLOAT_LITERAL | boolean_literal | 'empty' | 'now' ;
+boolean_literal = 'true' | 'no' ;
+
+list_literal = '(' , [ expression , { ',' , expression } ] , ')' ;
+map_literal = '(' , [ map_entry , { ',' , map_entry } ] , ')' ;
+map_entry = IDENTIFIER , ':' , expression ;
+
+map_block_assignment_rhs = NEWLINE , INDENT , { map_block_entry } , DEDENT ;
+map_block_entry = IDENTIFIER , 'is' , expression , NEWLINE ;
+
+function_definition = 'fn' , IDENTIFIER , [ function_parameters ] , function_body ;
+function_parameters = '(' , [ parameter_definition , { ',' , parameter_definition } ] , ')' ;
+parameter_definition = IDENTIFIER , [ ':' , expression ] ;
+
+function_body = ( expression , NEWLINE )
+              | ( NEWLINE , INDENT , { statement } , [ [ 'return' ] , expression , NEWLINE ] , DEDENT )
+              | ( NEWLINE , INDENT , { statement } , DEDENT )
+              ;
+
+object_definition = 'object' , IDENTIFIER , NEWLINE , INDENT , { object_member } , DEDENT ;
+object_member = field_definition | method_definition ;
+field_definition = IDENTIFIER , [ '?' , expression ] , NEWLINE ;
+method_definition = IDENTIFIER , [ function_parameters ] , function_body ;
+
+store_definition = 'store' , [ 'actor' ] , IDENTIFIER , [ 'for' , IDENTIFIER ] , NEWLINE , INDENT , { store_member } , DEDENT ;
+store_member = field_definition | method_definition | relation_definition | cast_definition | receive_handler ;
+relation_definition = '&' , IDENTIFIER , NEWLINE ;
+cast_definition = 'as' , ( 'string' | 'map' | 'list' ) , cast_body ;
+cast_body = ( expression , NEWLINE )
+          | ( NEWLINE , INDENT , { ( expression | assignment ) , NEWLINE } , DEDENT )
+          ;
+receive_handler = '@' , IDENTIFIER , function_body ;
+
+conditional_statement = if_then_else_statement
+                      | unless_statement
+                      | postfix_unless_statement
+                      ;
+
+if_then_else_statement = 'if' , expression , statement_or_block
+                         , { 'else' , 'if' , expression , statement_or_block }
+                         , [ 'else' , statement_or_block ]
+                         ;
+unless_statement = 'unless' , expression , statement_or_block ;
+postfix_unless_statement = expression_statement , 'unless' , expression ;
+
+statement_or_block = statement
+                   | ( NEWLINE , INDENT , { statement } , DEDENT )
+                   ;
+
+loop_statement = while_loop | until_loop | iterate_loop ;
+
+while_loop = 'while' , expression , statement_or_block ;
+until_loop = 'until' , expression , statement_or_block ;
+iterate_loop = 'iterate' , expression , [ '(' , IDENTIFIER , ')' ]? , statement_or_block ;
+
+error_handler_suffix = 'err' , error_action ;
+error_action = ( 'return' , [ expression ] ) | expression | statement_or_block ;    
+
+module_definition = 'mod' , IDENTIFIER , NEWLINE , INDENT , { top_level_statement } , DEDENT ;
+use_statement = 'use' , qualified_identifier ;
+qualified_identifier = IDENTIFIER , { '.' , IDENTIFIER } ;
+
+(* Lexical Tokens:
+   IDENTIFIER, STRING_LITERAL, INTEGER_LITERAL, FLOAT_LITERAL, DOLLAR_PARAM,
+   NEWLINE, INDENT, DEDENT, EOF,
+   Keywords: 'is', 'fn', 'true', 'no', 'if', 'else', 'unless', 'while', 'until', 'iterate', 'return', 'mod', 'use', 'object', 'store', 'actor', 'empty', 'now', 'or', 'and', 'not', 'equals', 'as', 'for', 'err',
+   Symbols: '.', '(', ')', ',', ':', '+', '-', '*', '/', '%', '=', '>', '>=', '<', '<=', '?', '!', '&', '@'
+*)
