@@ -1,6 +1,8 @@
 from lexer import Lexer, Token
 from parser import Parser, ParseError
 from ast_nodes import ASTNode # For type hint or direct use if needed
+import llvmlite.ir
+from ir_generator import IRGenerator
 
 def get_ast(coral_code: str):
     """
@@ -19,31 +21,75 @@ def get_ast(coral_code: str):
         return None
 
 if __name__ == "__main__":
-    sample_codes = [
-        "",
-        "// Just a comment\n",
-        "x is 10\n",
-        "y is \"hello\"\n",
-        "fn my_func(a, b: 20)\n  return a + b\n",
-        "object Point\n  x\n  y\n  m(self)\n    return self.x\n",
-        "store DataStore for Thing\n  &relation_name\n  as map\n    original_id is self.id\n  @on_create\n    log(\"Created!\")\n",
-        "x is @ // Invalid token",
-        "fn broken\n  x is 1\n y is 2 // Missing dedent",
-        "a is (1 + 2) * 3\n",
-        "if x > 10\n  print(\"big\")\nelse if x > 5\n  print(\"medium\")\nelse\n  print(\"small\")\n",
-        "val unless condition\n",
-        "unless condition_is_true\n  do_something()\n",
-        "while i < 10\n  i is i + 1\n",
-        "iterate my_list (item)\n  print(item)\n"
-    ]
+    # Test script for scaffolding of Objects, Lists, Maps, Stores, and Error Handlers.
+    test_coral_code = """
+object Point
+  x // Field
+  y // Field
 
-    for i, code in enumerate(sample_codes):
-        print(f"--- Sample Code {i+1} ---")
-        print(code.strip())
-        print("--- AST ---")
-        ast_tree = get_ast(code)
-        if ast_tree:
-            print(repr(ast_tree))
-        print("--- End ---")
-        if i < len(sample_codes) - 1:
-            print("\n" + "="*30 + "\n")
+  fn move(dx, dy) // Method
+    // this.x = this.x + dx // Future feature
+    return dx // Placeholder to make it a valid function for now
+
+store UserData // Store definition
+  name
+  age
+
+  @on_create // Method-like store member
+  fn created_log()
+    return "UserData created"
+
+
+// Test Object.make()
+p is Point.make()
+p // ExpressionStatement to observe 'p'
+
+// Test List Literal (scaffolding)
+my_list is (1, 2, "hello") // Elements are ignored by current list literal scaffolding
+my_list // ExpressionStatement
+
+// Test Map Literal (scaffolding)
+my_map is (name: "Coral", version: 0.1) // Entries are ignored by current map literal scaffolding
+my_map // ExpressionStatement
+
+// Test Store (treated as object for .make())
+ud is UserData.make()
+ud // ExpressionStatement
+
+// Test Error Handler Suffix (scaffolding)
+fn process_data(data)
+  return data // placeholder, could be an operation that might fail
+
+raw_data is "some_info"
+processed_data is process_data(raw_data) err "Error processing data"
+processed_data // ExpressionStatement, should be 'raw_data' for now
+
+another_val is 10 / 0 err "Division by zero!" // This would ideally use the error handler
+another_val
+    """
+
+    print("--- Coral Source Code ---")
+    print(test_coral_code)
+
+    print("\n--- Abstract Syntax Tree (AST) ---")
+    ast_tree = get_ast(test_coral_code)
+    if ast_tree:
+        print(repr(ast_tree))
+
+        print("\n--- LLVM Intermediate Representation (IR) ---")
+        try:
+            ir_gen = IRGenerator()
+            module = ir_gen.generate(ast_tree)
+            if module:
+                print(str(module))
+            else:
+                print("IR Generation returned None or an empty module.")
+        except Exception as e:
+            print(f"Error during IR generation: {e}")
+            import traceback
+            traceback.print_exc() # Print full stack trace for debugging
+
+    else:
+        print("AST generation failed, skipping IR generation.")
+
+    print("\n--- End of Test Run ---")
