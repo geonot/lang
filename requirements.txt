@@ -1,0 +1,4 @@
+llvmlite
+six # Add six as a dependency for llvmlite
+enum34; python_version < '3.4' # Add enum34 for older python versions
+funcsigs; python_version < '3.3' # Add funcsigs for older python versions
