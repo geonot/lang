@@ -129,32 +129,31 @@ class Parser:
         if self.current_token.type == KW_RETURN: return self.parse_return_statement()
         if self.current_token.type == KW_USE: return self.parse_use_statement()
         if self.current_token.type == KW_IF: return self.parse_if_then_else_statement()
-        # Postfix unless is handled after expression parsing. This is for prefix unless.
-        if self.current_token.type == KW_UNLESS and self.peek().type != NEWLINE and self.peek().type != EOF :
-            # Check if it's prefix unless: `unless expr block` vs `expr unless expr`
-            # This is a heuristic: if `unless` is not immediately followed by something that looks like the end of `expr unless cond`,
-            # then it's a prefix unless.
-            # A more robust way would be to parse expr, then check for `unless`. If not, and current was `unless`, backtrack or structure differently.
-            # For now, assume if we are here, it's a prefix `unless condition block`.
-            # The `parse_statement` logic for postfix unless handles the other case.
-            # This means `parse_unless_statement` will only be called for prefix form.
+
+        # New handling for prefix unless: if a statement starts with KW_UNLESS
+        if self.current_token.type == KW_UNLESS:
             return self.parse_prefix_unless_statement()
 
         if self.current_token.type == KW_WHILE: return self.parse_while_loop()
         if self.current_token.type == KW_UNTIL: return self.parse_until_loop()
         if self.current_token.type == KW_ITERATE: return self.parse_iterate_loop()
 
+        # Try parsing an expression first (for expression statements, assignments, or postfix unless)
         expr_node = self.parse_expression()
 
+        # Check for postfix unless
         if self.consume_if(KW_UNLESS):
             condition_expr = self.parse_expression()
-            # Original expr_node location might be more accurate for the statement itself
             stmt_loc = expr_node.location_info if hasattr(expr_node, 'location_info') else loc
-            full_expr_node = FullExpressionNode(expression=expr_node, error_handler=None, location_info=expr_node.location_info if hasattr(expr_node, 'location_info') else stmt_loc)
-            stmt_node = ExpressionStatementNode(expression=full_expr_node, location_info=stmt_loc)
-            self.expect_newline_or_eof("Expected newline or EOF after postfix unless statement.")
-            return PostfixUnlessStatementNode(expression_statement=stmt_node, condition=condition_expr, location_info=stmt_loc)
 
+            # Create FullExpressionNode and ExpressionStatementNode for the PostfixUnlessStatementNode
+            full_expr_node = FullExpressionNode(expression=expr_node, error_handler=None, location_info=expr_node.location_info if hasattr(expr_node, 'location_info') else stmt_loc)
+            expr_stmt_node = ExpressionStatementNode(expression=full_expr_node, location_info=stmt_loc)
+
+            self.expect_newline_or_eof("Expected newline or EOF after postfix unless statement.")
+            return PostfixUnlessStatementNode(expression_statement=expr_stmt_node, condition=condition_expr, location_info=stmt_loc)
+
+        # Handle assignment or regular expression statement
         if self.consume_if(KW_IS):
             assign_loc = expr_node.location_info if hasattr(expr_node, 'location_info') else loc
             if not isinstance(expr_node, (IdentifierNode, PropertyAccessNode, ListElementAccessNode, DollarParamNode)): # Added DollarParamNode
@@ -257,17 +256,56 @@ class Parser:
                 prop_token = self.consume(IDENTIFIER)
                 prop_ident_node = IdentifierNode(prop_token.value, location_info=(prop_token.line, prop_token.column))
                 base_expr = PropertyAccessNode(base_expr=base_expr, property_name=prop_ident_node, location_info=current_op_loc) # loc of '.'
-            elif self.current_token.type == SYM_LPAREN and not self.is_start_of_call_operation_args(base_expr):
-                 # This check `is_start_of_call_operation_args` is tricky.
-                 # EBNF: value_or_invocation = primary_expression_base , { property_access_suffix | list_element_access_suffix } , [ call_operation ] ;
-                 # This means suffixes are parsed first. Then call_operation.
-                 # So if LPAREN is for list access, it's consumed here. If for call, it's handled later.
-                 # Heuristic: if what's inside LPAREN looks like a simple expression for index, it's access.
-                 # This can be ambiguous: `a(b)` could be call or access. Context or grammar rules needed.
-                 # For now, assume if not clearly a call's arg structure, it could be access.
-                 # This is a known simplification point.
+            elif self.current_token.type == SYM_LPAREN:
+                # Try to distinguish list access `base_expr(index_expr)` from a call `base_expr(args...)`
+                # EBNF implies suffixes (like list access) are parsed before attempting call_operation.
+                # Lookahead to see if it's NOT a list access.
+                # If it looks like a call (e.g. named args, empty args, multiple args), break to parse as call.
+                peek_token = self.peek()
+                peek_after_peek_token = self.peek(2)
+
+                if peek_token.type == SYM_RPAREN: # e.g. base() -> call, not list access
+                    break
+                if peek_token.type == IDENTIFIER and peek_after_peek_token.type == SYM_COLON: # e.g. base(name: val) -> call
+                    break
+                # If we see `expr ,`, it's likely a call with multiple arguments.
+                # This requires parsing an expression first to see if a comma follows.
+                # For simplicity, if it's not an obvious call starter, attempt to parse as list access.
+                # A more robust method would involve more sophisticated lookahead or tentative parsing.
+
+                # Try to parse as list_element_access: ( expression )
+                # If this structure is not strictly met, it will either error or (ideally) be handled by call parsing.
+                # This is a point where grammar ambiguity `a(b)` (call or access) is tricky without type info or stricter syntax.
+                # Assuming list access is `(one_expression_then_rparen)`
+                # We will consume LPAREN, parse one expression, then expect RPAREN.
+                # If a comma appears after the expression, it's a call, and we should have broken.
+                # This path is taken if it's not `()` or `(ident: val)`.
+                # It could be `(expr)` or `(expr, ...)`. We want to parse `(expr)` as list access.
+                # If after parsing `expr`, the next token is COMMA, it's a call.
+
+                # Let's check if the expression inside LPAREN is followed by COMMA
+                # This is still tricky. For now, let's assume if it's not clearly a multi-arg or named-arg call,
+                # we attempt list access. The ambiguity of `a(b)` will default to list access if `b` is a simple expression.
+                # If `parse_expression()` consumes tokens and then a comma is found, we can't easily backtrack here.
+
+                # Simplified approach: if it wasn't `()` or `(ident: val)`, try list access.
+                # If `parse_expression` inside list access fails or `)` isn't found, it's a syntax error for list access.
                 self.consume(SYM_LPAREN)
                 index_expr = self.parse_expression()
+                # If after parsing index_expr, the current token is a comma, then it was actually a call.
+                # This is hard to backtrack from.
+                # The current EBNF implies `list_element_access_suffix` is `( expression )`.
+                # So, if there's a comma, it means it wasn't a valid list_element_access_suffix.
+                if self.current_token.type == SYM_COMMA:
+                    # This indicates it was actually a call like `foo(arg1, arg2)`.
+                    # Backtracking is needed here. This is a limitation of the current single-pass parser.
+                    # For now, this will lead to a parse error expecting ')' if a comma is found.
+                    # This is an area for future improvement (e.g. tentative parsing or more lookahead).
+                    # To make progress, we will assume that if it's not `()` or `(ident: val)`,
+                    # and we parse an expression, the next token *must* be `)` for it to be a list access.
+                    # If it's a comma, then `consume(SYM_RPAREN)` below will fail.
+                    pass # Let consume RPAREN handle it.
+
                 self.consume(SYM_RPAREN, "Expected ')' after list element access index.")
                 base_expr = ListElementAccessNode(base_expr=base_expr, index_expr=index_expr, location_info=current_op_loc) # loc of '('
             else:
@@ -278,33 +316,8 @@ class Parser:
 
         return base_expr
 
-    def is_start_of_call_operation_args(self, callee_expr):
-        # Simplified check if LPAREN starts arguments for a call vs. list access or grouping
-        if self.current_token.type == SYM_LPAREN:
-            # If the callee is an identifier or property access, LPAREN is more likely for a call.
-            if isinstance(callee_expr, (IdentifierNode, PropertyAccessNode)):
-                # Further check: list access `obj(index)` vs call `func(arg)`.
-                # If `callee_expr` cannot be called (e.g., a non-function variable), then `(..)` must be list access.
-                # This requires type system info not available at parse time.
-                # A common syntactic distinction: `a (b)` (call with space) vs `a(b)` (list access or call).
-                # Coral EBNF doesn't show space sensitivity here typically.
-                # For now, assume `is_start_of_call_operation` will make the main decision.
-                # This helper is mostly to prevent list access from consuming call's LPAREN.
-                # If `value_or_invocation` parses suffixes first, then `call_operation`, then list access should be greedily matched if it's `base(index_expr)`.
-                # This means `is_start_of_call_operation_args` should probably return False more often to let list access try first.
-                # Let's assume `value_or_invocation` structure handles this: suffixes are tried, then call.
-                # So if `LPAREN` is encountered in the suffix loop, it must be list access.
-                # The check `and not self.is_start_of_call_operation_args(base_expr)` in `parse_value_or_invocation` loop for LPAREN
-                # is trying to distinguish. If it *is* call args, then the suffix loop should break.
-                # This is circular. A better way:
-                # In `parse_value_or_invocation` loop:
-                # if SYM_DOT: property access
-                # if SYM_LPAREN and LOOKAHEAD indicates list access (e.g. simple expr then RPAREN, not full arg list): list access
-                # else: break from suffix loop.
-                # Then, after suffix loop, try `parse_call_operation`.
-                # For now, the existing structure is kept. This is a point of fragility.
-                return True # Overly simple: assume LPAREN after a potential callee is args start.
-        return False
+    # Removed is_start_of_call_operation_args as its logic is being integrated or simplified
+    # def is_start_of_call_operation_args(self, callee_expr): ...
 
     def is_start_of_call_operation(self, callee_expr):
         if self.current_token.type == SYM_DOT and (self.peek().type == IDENTIFIER or self.peek().type == KW_ACROSS):
@@ -313,7 +326,7 @@ class Parser:
         # If callee is an Identifier and next token can start arguments (paren, or a potential first arg for no-paren call)
         if isinstance(callee_expr, IdentifierNode):
             # Potential start of no_paren_space_separated_argument_list or paren_argument_list
-            if self.current_token.type == SYM_LPAREN: return True
+            if self.current_token.type == SYM_LPAREN: return True # LPAREN always means call if it reaches here
             # Check for tokens that can start an expression but are not binary operators that would bind tighter
             # This is to allow `func arg1 arg2`
             if self.current_token.type in [IDENTIFIER, INTEGER_LITERAL, FLOAT_LITERAL, STRING_LITERAL, KW_TRUE, KW_NO, KW_EMPTY, KW_NOW, DOLLAR_PARAM] and \
@@ -322,8 +335,8 @@ class Parser:
 
         # If callee_expr is some other callable expression, e.g. (get_func()) arg1 ...
         # This typically requires parentheses for the arguments: (get_func())(arg1)
-        if self.current_token.type == SYM_LPAREN and not isinstance(callee_expr, (IdentifierNode, PropertyAccessNode)): # Avoid double-counting if already handled
-             # If callee_expr is complex, LPAREN usually means a call.
+        # If LPAREN is current after suffixes, it must be a call.
+        if self.current_token.type == SYM_LPAREN: # Handles cases like (expr)(args) or list[i](args)
              return True
 
         return False
@@ -402,7 +415,8 @@ class Parser:
                     # For AST simplicity, just return first_expr. If GroupedExpressionNode is needed, wrap it.
                     return first_expr
         else:
-            raise ParseError(f"Unexpected token {token.type} ('{token.value}') when expecting a primary expression.", token)
+            expected_things = "a literal (integer, float, string), an identifier, '$parameter', '(', or keywords like 'true', 'no', 'empty', 'now'"
+            raise ParseError(f"Unexpected token {token.type} ('{token.value}') when expecting {expected_things}.", token)
 
     def parse_map_entry(self):
         loc = (self.current_token.line, self.current_token.column)
@@ -476,80 +490,65 @@ class Parser:
         # method_definition = IDENTIFIER , [ function_parameters ] , function_body ;
         # field_definition  = IDENTIFIER , [ '?' , expression ] , NEWLINE ;
 
-        # Lookahead for method indicators:
-        # 1. `IDENTIFIER (` -> params, definitely method
-        # 2. `IDENTIFIER :` -> type annotation or start of expression body (not in EBNF for method body start, but could be param type)
-        #    If `IDENTIFIER : type_expr` for params, then method.
-        #    If `IDENTIFIER : expr NL` for body -> method (not in current EBNF, but possible lang feature)
-        # 3. `IDENTIFIER NL INDENT` -> block body, method with no params
-        # 4. `IDENTIFIER expr NL` -> single expr body, method with no params
-
-        # Default to field if none of the above strong method indicators are met.
-        is_method = False
-        if self.current_token.type == SYM_LPAREN: # Case 1
-            is_method = True
-        elif self.current_token.type == NEWLINE and self.peek().type == INDENT: # Case 3
-            is_method = True
-        elif self.current_token.type not in [SYM_QUESTION, NEWLINE, EOF, DEDENT]:
-            # This is potentially `IDENTIFIER expr NL` (method) vs `IDENTIFIER ? expr NL` (field) or `IDENTIFIER NL` (field)
-            # If it's not '?' or NEWLINE, it might be the start of an expression for a single-line method body.
-            # This is the most ambiguous. A field is simply `IDENTIFIER NEWLINE` or `IDENTIFIER ? expr NEWLINE`.
-            # If current token can start an expression and is not '?', it's likely method.
-            # This heuristic is imperfect. e.g. `my_var some_other_identifier` could be start of method `my_var some_other_identifier NL`
-            # or `my_var` is a field, and `some_other_identifier` starts next statement (if newline was missing).
-            # Given `function_body = (expression, NEWLINE)`, if we see an expression starting token, assume method.
-            if self.current_token.type not in [KW_IS, KW_ERR, KW_UNLESS, SYM_DOT, SYM_RPAREN, SYM_COMMA, SYM_COLON, SYM_QUESTION, SYM_EXCLAMATION] + list(self.get_binary_operator_tokens()):
-                 # Check if the expression is followed by a NEWLINE, which is characteristic of a single-expression method body.
-                 # This requires more lookahead or a trial parse.
-                 # For now, if it's not '?' and not directly a NEWLINE, assume it *could* be a method's expression body.
-                 # This part needs to be cautious not to misinterpret a field followed by a new statement on the same line (if grammar allowed).
-                 # However, Coral is newline-sensitive for statements.
-                 is_method = True # Tentative: if it looks like an expression, assume method body.
-
-        if is_method:
+        # 1. Check for `IDENTIFIER (` (Method with parameters)
+        if self.current_token.type == SYM_LPAREN:
             params = []
-            if self.consume_if(SYM_LPAREN): # Handles `IDENTIFIER (`
-                if self.current_token.type != SYM_RPAREN:
+            self.consume(SYM_LPAREN) # Consume the LPAREN
+            if self.current_token.type != SYM_RPAREN:
+                params.append(self.parse_parameter_definition())
+                while self.consume_if(SYM_COMMA):
+                    if self.current_token.type == SYM_RPAREN: break # Trailing comma
                     params.append(self.parse_parameter_definition())
-                    while self.consume_if(SYM_COMMA):
-                        if self.current_token.type == SYM_RPAREN: break
-                        params.append(self.parse_parameter_definition())
-                self.consume(SYM_RPAREN, "Expected ')' after method parameters.")
-
+            self.consume(SYM_RPAREN, "Expected ')' after method parameters.")
             body_node = self.parse_function_body_content(member_name_node.name)
             return MethodDefinitionNode(name=member_name_node, params=params, body=body_node, location_info=member_loc)
-        else: # Field
-            default_value = None
-            if self.consume_if(SYM_QUESTION):
-                default_value = self.parse_expression()
+
+        # 2. Check for `IDENTIFIER ?` (Field with default value)
+        elif self.current_token.type == SYM_QUESTION:
+            self.consume(SYM_QUESTION) # Consume '?'
+            default_value = self.parse_expression()
             self.consume(NEWLINE, f"Expected newline after field definition for '{member_name_node.name}'.")
             return FieldDefinitionNode(name=member_name_node, default_value=default_value, location_info=member_loc)
 
+        # 3. Check for `IDENTIFIER NEWLINE`
+        elif self.current_token.type == NEWLINE:
+            # Peek ahead to distinguish `IDENTIFIER NEWLINE INDENT` (method) from `IDENTIFIER NEWLINE` (field)
+            if self.peek().type == INDENT: # Method with block body, no params
+                # `parse_function_body_content` expects to be called when NEWLINE is current and INDENT follows
+                body_node = self.parse_function_body_content(member_name_node.name)
+                return MethodDefinitionNode(name=member_name_node, params=[], body=body_node, location_info=member_loc)
+            else: # Field `IDENTIFIER NEWLINE` (no default value)
+                self.consume(NEWLINE) # Consume the NEWLINE
+                return FieldDefinitionNode(name=member_name_node, default_value=None, location_info=member_loc)
+
+        # 4. `IDENTIFIER expression NEWLINE` (Method with single expression body, no params)
+        # This is the case if current_token is not LPAREN, QUESTION, or NEWLINE after IDENTIFIER.
+        else:
+            # This implies a method with no parameters and a single expression body.
+            # `parse_function_body_content` handles the `expression NEWLINE` case.
+            params = [] # No parameters
+            body_node = self.parse_function_body_content(member_name_node.name)
+            return MethodDefinitionNode(name=member_name_node, params=params, body=body_node, location_info=member_loc)
+
 
     def parse_function_body_content(self, func_name_for_error="function"):
+        # EBNF for function_body:
+        # ( expression , NEWLINE )
+        # | ( NEWLINE , INDENT , { statement } , [ [ 'return' ] , expression , NEWLINE ] , DEDENT )
+        # | ( NEWLINE , INDENT , { statement } , DEDENT )
         body_node = None
-        # EBNF: ( expression , NEWLINE )
-        #     | ( NEWLINE , INDENT , { statement } , [ [ 'return' ] , expression , NEWLINE ] , DEDENT )
-        #     | ( NEWLINE , INDENT , { statement } , DEDENT )
-
-        if self.current_token.type == NEWLINE and self.peek().type == INDENT:
+        if self.current_token.type == NEWLINE and self.peek().type == INDENT: # Block body
             self.consume(NEWLINE)
             self.consume(INDENT)
             body_statements = []
             # Parse statements
             while self.current_token.type != DEDENT and self.current_token.type != EOF:
-                # Check for optional final return part: [ [ 'return' ] , expression , NEWLINE ]
-                # This check should be done if the *next* token after this potential part is DEDENT.
-                if self.peek_is_dedent_after_possible_return():
-                    # If current is KW_RETURN, or can start an expression AND is followed by NEWLINE then DEDENT
-                    is_explicit_return = self.current_token.type == KW_RETURN
-                    # Try to parse `[['return'] expression NEWLINE]`
-                    # This is complex. For now, rely on parsing a ReturnStatement or an ExpressionStatement.
-                    # The EBNF implies that `expression NEWLINE` at the end of a block acts as a return.
-                    # This can be handled by the last statement in `body_statements` if it's an ExpressionStatement.
-                    # No special parsing here, semantic analysis or codegen can interpret last ExpressionStatement.
-                    pass # Fall through to parse_statement
-
+                # The EBNF `[ [ 'return' ] , expression , NEWLINE ]` before DEDENT
+                # is handled naturally by self.parse_statement().
+                # If 'return expression NEWLINE' is last, it's a ReturnStatementNode.
+                # If 'expression NEWLINE' is last, it's an ExpressionStatementNode.
+                # Semantic analysis can determine if the last ExpressionStatementNode
+                # should be treated as an implicit return.
                 body_statements.append(self.parse_statement())
 
             # After loop, if last statement was an expression that should be an implicit return,
@@ -560,29 +559,13 @@ class Parser:
             expr_loc = (self.current_token.line, self.current_token.column)
             body_expr = self.parse_expression()
             self.expect_newline_or_eof(f"Expected newline or EOF after single expression body for {func_name_for_error}.")
+            # body_expr itself is the node (e.g. ExpressionNode)
             body_node = body_expr
 
         return body_node
 
-    def peek_is_dedent_after_possible_return(self):
-        # Helper to check if `DEDENT` follows a potential `[['return'] expression NEWLINE]`
-        # This is a rough check.
-        pos_after_expr_and_newline = 0
-        if self.current_token.type == KW_RETURN:
-            #Approximate length of 'return' + ' ' + minimal_expr + NEWLINE
-            pos_after_expr_and_newline = self.pos + 3
-        elif self.current_token.type not in [NEWLINE, EOF, DEDENT]: # Potential start of expression
-            #Approximate length of minimal_expr + NEWLINE
-            pos_after_expr_and_newline = self.pos + 2
-        else:
-            return False
-
-        if pos_after_expr_and_newline < len(self.tokens) -1 : # Need at least one token for DEDENT
-             #This is extremely simplified. A real lookahead would parse the expression.
-             #For now, this heuristic is not robust enough to use reliably.
-             #return self.tokens[pos_after_expr_and_newline].type == DEDENT
-             pass
-        return False # Disable for now
+    # Removed peek_is_dedent_after_possible_return as its logic is subsumed by the main statement parsing loop.
+    # The EBNF's optional final return expression is handled by parse_statement() if present.
 
     def parse_store_definition(self):
         loc = (self.current_token.line, self.current_token.column)
@@ -753,77 +736,63 @@ class Parser:
 
     def parse_call_operation(self, callee_expr):
         call_loc = callee_expr.location_info # Use callee's location as start of call operation
-
-        call_style = ""
+        actual_callee = callee_expr
         arguments = []
-        actual_callee = callee_expr # This might change if it's a method call like obj.method
+        # call_style can be simplified or made more granular if needed by AST consumers or for debugging.
+        # For now, it primarily distinguishes dot vs direct and paren vs no-paren.
+        call_style = ""
 
+        # Path 1: Dot Call (e.g., callee_expr.method_or_across ...)
         if self.current_token.type == SYM_DOT and (self.peek().type == IDENTIFIER or self.peek().type == KW_ACROSS):
             dot_loc = (self.current_token.line, self.current_token.column)
             self.consume(SYM_DOT)
             method_or_across_token = self.current_token
+            self.advance() # Consume IDENTIFIER or KW_ACROSS
 
             prop_name_val = method_or_across_token.value
             prop_loc = (method_or_across_token.line, method_or_across_token.column)
-            self.advance()
-
             prop_ident_node = IdentifierNode(prop_name_val, location_info=prop_loc)
             actual_callee = PropertyAccessNode(base_expr=callee_expr, property_name=prop_ident_node, location_info=dot_loc)
-            current_call_style = "dot_method" if method_or_across_token.type == IDENTIFIER else "dot_across"
 
+            method_type = "dot_method" if method_or_across_token.type == IDENTIFIER else "dot_across"
+
+            # Arguments for dot call
+            if self.current_token.type == SYM_LPAREN:
+                arguments, _ = self.parse_paren_argument_list() # parse_paren_argument_list returns (args, style_string)
+                call_style = f"{method_type}_paren"
+            # Check for no_paren_space_separated_argument_list
+            elif self.current_token.type not in [NEWLINE, EOF, DEDENT, KW_IS, KW_ERR, KW_UNLESS, SYM_DOT, SYM_LPAREN, SYM_RPAREN, SYM_COMMA, SYM_COLON, SYM_QUESTION, SYM_EXCLAMATION] + list(self.get_binary_operator_tokens()):
+                arguments, _ = self.parse_no_paren_space_separated_argument_list()
+                call_style = f"{method_type}_no_paren_space"
+            else: # No arguments
+                arguments = []
+                call_style = f"{method_type}_empty"
+
+        # Path 2: Direct Call (e.g., callee_expr(args...) or callee_expr arg1 arg2 ...)
+        # Current token is NOT SYM_DOT. callee_expr is the function.
+        else:
             if self.current_token.type == SYM_LPAREN:
                 arguments, _ = self.parse_paren_argument_list()
-                call_style = current_call_style # Retain dot_method/dot_across
-            elif self.current_token.type != NEWLINE and self.current_token.type != EOF and \
-                 self.current_token.type not in [KW_IS, KW_ERR, KW_UNLESS, SYM_QUESTION, SYM_EXCLAMATION, SYM_COMMA, SYM_RPAREN, SYM_COLON, DEDENT] + self.get_binary_operator_tokens():
+                call_style = "direct_paren"
+            # Check for no_paren_space_separated_argument_list.
+            # This form is generally applicable whether callee_expr is an IdentifierNode or a more complex expression like (get_func()).
+            # The condition checks if the current token can start an expression for an argument.
+            elif self.current_token.type not in [NEWLINE, EOF, DEDENT, KW_IS, KW_ERR, KW_UNLESS, SYM_DOT, SYM_LPAREN, SYM_RPAREN, SYM_COMMA, SYM_COLON, SYM_QUESTION, SYM_EXCLAMATION] + list(self.get_binary_operator_tokens()):
                 arguments, _ = self.parse_no_paren_space_separated_argument_list()
-                call_style = current_call_style # Retain dot_method/dot_across
-            else:
+                call_style = "direct_no_paren_space"
+                # Could add detail: if isinstance(actual_callee, IdentifierNode): call_style += "_identifier_callee"
+            else: # No arguments, or not a recognized argument pattern for a direct call
                 arguments = []
-                call_style = current_call_style + "_empty" # e.g. "dot_method_empty"
-
-        else: # Direct call (no dot for this specific call segment)
-            if self.current_token.type == SYM_LPAREN:
-                arguments, _ = self.parse_paren_argument_list()
-                call_style = "paren_direct"
-            # Check for no_paren_space_separated_argument_list (typically for IDENTIFIER callee)
-            elif isinstance(actual_callee, IdentifierNode) and \
-                 self.current_token.type != NEWLINE and self.current_token.type != EOF and \
-                 self.current_token.type not in [KW_IS, KW_ERR, KW_UNLESS, SYM_QUESTION, SYM_EXCLAMATION, SYM_COMMA, SYM_RPAREN, SYM_COLON, DEDENT] + self.get_binary_operator_tokens():
-                arguments, _ = self.parse_no_paren_space_separated_argument_list()
-                call_style = "no_paren_identifier"
-            # Check for no_paren_comma_separated_argument_list (typically for complex callee like (expr))
-            elif not isinstance(actual_callee, IdentifierNode) and \
-                 self.current_token.type != NEWLINE and self.current_token.type != EOF and \
-                 self.current_token.type not in [KW_IS, KW_ERR, KW_UNLESS, SYM_QUESTION, SYM_EXCLAMATION, SYM_LPAREN, SYM_RPAREN, SYM_COLON, DEDENT] + self.get_binary_operator_tokens() and \
-                 self.peek_has_comma_before_terminator(): # Heuristic: if first arg is followed by comma
-                arguments, _ = self.parse_no_paren_comma_separated_argument_list()
-                call_style = "no_paren_comma_direct"
-            else:
-                arguments = []
-                call_style = "empty_direct"
+                call_style = "direct_empty"
 
         return CallOperationNode(callee=actual_callee, arguments=arguments, call_style=call_style, location_info=call_loc)
 
-    def peek_has_comma_before_terminator(self):
-        # Simple lookahead to see if a comma appears before a line break or other argument list terminator.
-        # This helps distinguish `(func) arg1, arg2` from `(func) arg1` then something else.
-        # This is a simplified heuristic.
-        for i in range(1, 5): # Look ahead a few tokens
-            pk = self.peek(i)
-            if pk.type == SYM_COMMA: return True
-            if pk.type in [NEWLINE, EOF, DEDENT, SYM_LPAREN, SYM_RPAREN]: return False
-        return False
+    # Removed peek_has_comma_before_terminator as no_paren_comma_separated_argument_list is removed for simplification.
+    # def peek_has_comma_before_terminator(self): ...
 
-    def parse_no_paren_comma_separated_argument_list(self):
-        # no_paren_comma_separated_argument_list = expression_for_no_paren_call , { ',' , expression_for_no_paren_call } ;
-        args = []
-        if self.current_token.type not in [NEWLINE, EOF, DEDENT, KW_IS, KW_ERR, KW_UNLESS, SYM_DOT, SYM_LPAREN, SYM_RPAREN, SYM_COMMA, SYM_COLON, SYM_QUESTION, SYM_EXCLAMATION] + list(self.get_binary_operator_tokens()):
-            args.append(self.parse_expression_for_no_paren_call())
-            while self.consume_if(SYM_COMMA):
-                if self.current_token.type in [NEWLINE, EOF, DEDENT]: break # Stop if comma is trailing before newline etc.
-                args.append(self.parse_expression_for_no_paren_call())
-        return args, "no_paren_comma_args"
+    # Removed parse_no_paren_comma_separated_argument_list to simplify argument parsing.
+    # No-paren calls will rely on space separation. Comma separation is for within parens.
+    # def parse_no_paren_comma_separated_argument_list(self): ...
 
     def parse_paren_argument_list(self):
         self.consume(SYM_LPAREN)
@@ -848,10 +817,11 @@ class Parser:
                 SYM_PLUS, SYM_MINUS, SYM_MUL, SYM_DIV, SYM_OPERATOR_MOD]
 
     def parse_expression_for_no_paren_call(self):
-        # EBNF: primary_expression_base | additive_expression
-        # This means it will not parse comparison, logical_or, logical_and if they are compound.
-        # Try parsing additive_expression. If it fails, try primary_expression_base.
-        # For now, simplified to additive_expression.
+        # EBNF: expression_for_no_paren_call = primary_expression_base | additive_expression ;
+        # This means it will not parse comparison, logical_or, logical_and if they are compound,
+        # as those are higher precedence than additive_expression.
+        # `parse_additive_expression` correctly handles this: it will parse a primary_expression_base
+        # if no additive operators (+, -) are found at its precedence level.
         return self.parse_additive_expression()
 
     def parse_argument(self):
@@ -906,9 +876,9 @@ class Parser:
             # A single statement. It should end with a NEWLINE (or EOF/DEDENT)
             # which is typically consumed by the caller or expect_newline_or_eof.
             # Here we just parse the statement itself.
+            # `parse_statement()` is responsible for consuming its own terminating newline.
             stmt = self.parse_statement()
-            # Ensure that single statement is properly terminated if it's not a block
-            self.expect_newline_or_eof("Single statement in if/else/loop must be followed by newline or EOF.")
+            # The call to expect_newline_or_eof here was redundant because parse_statement handles it.
             return stmt
 
 
