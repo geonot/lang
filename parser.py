@@ -448,6 +448,12 @@ class Parser:
         self.consume(INDENT)
         members = []
         while self.current_token.type != DEDENT and self.current_token.type != EOF:
+            # Skip any blank lines
+            while self.current_token.type == NEWLINE:
+                self.advance()
+            # If after skipping newlines we are at DEDENT or EOF, break the loop
+            if self.current_token.type == DEDENT or self.current_token.type == EOF:
+                break
             members.append(self._parse_field_or_method_member()) # Use helper
         self.consume(DEDENT)
         return ObjectDefinitionNode(name=name_node, members=members, location_info=loc)
