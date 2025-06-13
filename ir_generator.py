@@ -34,6 +34,48 @@ class IRGenerator:
         self.current_builder: IRBuilder = None
         self.current_llvm_function: Function = None
         self.current_symbol_table: dict = self.module_context.global_symbol_table
+        self.current_module_prefix: list[str] = []
+
+    def _get_mangled_name(self, original_name: str) -> str:
+        if not self.current_module_prefix:
+            return original_name
+        return "_".join(self.current_module_prefix + [original_name])
+
+    def _create_llvm_global_string_ptr(self, py_string: str, name_prefix: str = ".str") -> llvmlite.ir.Value:
+        """
+        Creates an LLVM global string constant and returns an i8* pointer to it.
+        Caches globals in self.module.globals.
+        """
+        if self.current_builder is None: # Should not happen if called from valid context
+            raise RuntimeError("Builder not initialized for creating global string.")
+
+        global_var_name = f"{name_prefix}.{py_string}"
+        # Sanitize global_var_name if py_string can contain invalid characters for LLVM names.
+        # For now, assume simple strings from identifiers or property names.
+        # Basic sanitization: replace non-alphanumeric with underscore
+        clean_py_string = ''.join(c if c.isalnum() else '_' for c in py_string)
+        if not clean_py_string or clean_py_string[0].isdigit(): # Ensure it's a valid C-like identifier part
+            clean_py_string = f"s_{clean_py_string}"
+        global_var_name = f"{name_prefix}.{clean_py_string}"
+
+
+        g_var = self.module.globals.get(global_var_name)
+        if g_var is None:
+            c_str_val = llvmlite.ir.Constant(
+                llvmlite.ir.ArrayType(llvmlite.ir.IntType(8), len(py_string) + 1),
+                bytearray(py_string.encode('utf-8') + b'\x00')
+            )
+            g_var = llvmlite.ir.GlobalVariable(self.module, c_str_val.type, name=global_var_name)
+            g_var.linkage = 'internal'
+            g_var.global_constant = True
+            g_var.initializer = c_str_val
+
+        idx_type = llvmlite.ir.IntType(32) # Consistent GEP index type
+        return self.current_builder.gep(
+            g_var,
+            [llvmlite.ir.Constant(idx_type, 0), llvmlite.ir.Constant(idx_type, 0)],
+            name=f"{clean_py_string}_ptr"
+        )
 
     def _get_variable_storage(self, name: str) -> llvmlite.ir.Value | None:
         if name in self.current_symbol_table:
@@ -52,6 +94,7 @@ class IRGenerator:
         # ... (rest of _generate_literal implementation as before, using self.current_builder)
         literal_type = node.literal_type
         value = node.value
+
         if literal_type == ast_nodes.LiteralType.INTEGER:
             return rt.create_integer_value(self.current_builder, int(value))
         elif literal_type == ast_nodes.LiteralType.FLOAT:
@@ -81,20 +124,79 @@ class IRGenerator:
     def _generate_assignment(self, node: ast_nodes.AssignmentNode):
         if self.current_builder is None or self.current_llvm_function is None:
             raise RuntimeError("Builder or function not initialized for assignment.")
-        if not isinstance(node.target, ast_nodes.IdentifierNode):
-            print(f"Warning: Assignment to target type {type(node.target).__name__} not supported. Skipped.")
-            return
-        var_name = node.target.name
-        rhs_coral_value_ptr = self._generate_expression(node.value)
+
+        # RHS Value Generation
+        rhs_coral_value_ptr: llvmlite.ir.Value | None = None
+        if isinstance(node.value, ast_nodes.MapBlockAssignmentRHSNode):
+            rhs_coral_value_ptr = self._generate_map_from_block(node.value)
+        elif isinstance(node.value, ast_nodes.ASTNode): # Should catch all other expression types
+            rhs_coral_value_ptr = self._generate_expression(node.value)
+        else:
+            # This case should ideally not be reached if parser ensures node.value is an ASTNode subtype
+            raise TypeError(f"Unsupported RHS type for assignment: {type(node.value)}")
+
         if rhs_coral_value_ptr is None:
-            print(f"Error: RHS of assignment to '{var_name}' evaluated to None. Skipping.")
+            # Attempt to get a name for the error message, if target is an identifier
+            target_name_for_error = "unknown_target"
+            if hasattr(node.target, 'name'): # Covers IdentifierNode
+                target_name_for_error = node.target.name
+            elif isinstance(node.target, (ast_nodes.ListElementAccessNode, ast_nodes.PropertyAccessNode)):
+                 # Could try to construct a string representation, but keep it simple for now
+                target_name_for_error = f"{type(node.target).__name__}"
+            print(f"Error: RHS of assignment to '{target_name_for_error}' evaluated to None. Skipping assignment.")
             return
-        var_storage_ptr = self._get_variable_storage(var_name)
-        if var_storage_ptr is None:
-            target_func_entry_builder = IRBuilder(self.current_llvm_function.entry_basic_block)
-            var_storage_ptr = target_func_entry_builder.alloca(rt.CoralValuePtrType, name=f"{var_name}_storage_ptr")
-            self._set_variable_storage(var_name, var_storage_ptr)
-        self.current_builder.store(rhs_coral_value_ptr, var_storage_ptr)
+
+        # LHS Target Handling
+        if isinstance(node.target, ast_nodes.IdentifierNode):
+            var_name = node.target.name
+            var_storage_ptr = self._get_variable_storage(var_name)
+            if var_storage_ptr is None:
+                # Allocate in function entry block to ensure it's available throughout the function
+                entry_b = self.current_llvm_function.entry_basic_block
+                if not entry_b.instructions:
+                    entry_builder = IRBuilder(entry_b)
+                else:
+                    first_instr_not_alloca = next((instr for instr in entry_b.instructions if not isinstance(instr, llvmlite.ir.AllocaInstr)), None)
+                    if first_instr_not_alloca:
+                        entry_builder = IRBuilder(entry_b)
+                        entry_builder.position_before(first_instr_not_alloca)
+                    else:
+                        entry_builder = IRBuilder(entry_b)
+                        if entry_b.instructions:
+                             entry_builder.position_after(entry_b.instructions[-1])
+                var_storage_ptr = entry_builder.alloca(rt.CoralValuePtrType, name=f"{var_name}_storage_ptr")
+                self._set_variable_storage(var_name, var_storage_ptr)
+            self.current_builder.store(rhs_coral_value_ptr, var_storage_ptr)
+
+        elif isinstance(node.target, ast_nodes.ListElementAccessNode):
+            target_list_access_node = node.target
+            list_ptr = self._generate_expression(target_list_access_node.base_expr)
+            index_ptr = self._generate_expression(target_list_access_node.index_expr)
+
+            func_name = "coral_runtime_list_set_element"
+            func_ty = llvmlite.ir.FunctionType(rt.VoidType, [rt.CoralValuePtrType, rt.CoralValuePtrType, rt.CoralValuePtrType])
+            set_elem_func = self.module.globals.get(func_name)
+            if set_elem_func is None or not isinstance(set_elem_func, llvmlite.ir.Function):
+                set_elem_func = llvmlite.ir.Function(self.module, func_ty, name=func_name)
+            self.current_builder.call(set_elem_func, [list_ptr, index_ptr, rhs_coral_value_ptr])
+
+        elif isinstance(node.target, ast_nodes.PropertyAccessNode):
+            target_prop_access_node = node.target
+            obj_ptr = self._generate_expression(target_prop_access_node.base_expr)
+            prop_name_str = target_prop_access_node.property_name.name
+
+            prop_name_llvm_ptr = self._create_llvm_global_string_ptr(prop_name_str, name_prefix=".str.prop_name")
+
+            func_name = "coral_runtime_object_set_property"
+            func_ty = llvmlite.ir.FunctionType(rt.VoidType, [rt.CoralValuePtrType, rt.ptr_to(llvmlite.ir.IntType(8)), rt.CoralValuePtrType])
+            set_prop_func = self.module.globals.get(func_name)
+            if set_prop_func is None or not isinstance(set_prop_func, llvmlite.ir.Function):
+                set_prop_func = llvmlite.ir.Function(self.module, func_ty, name=func_name)
+            self.current_builder.call(set_prop_func, [obj_ptr, prop_name_llvm_ptr, rhs_coral_value_ptr])
+
+        else:
+            print(f"Warning: Assignment to target type {type(node.target).__name__} not fully supported. Skipped.")
+            # Consider: raise NotImplementedError(f"Assignment to target type {type(node.target).__name__} not implemented.")
 
     def _generate_expression(self, node: ast_nodes.ASTNode) -> llvmlite.ir.Value:
         if isinstance(node, ast_nodes.LiteralNode):
@@ -111,40 +213,421 @@ class IRGenerator:
             return self._generate_list_literal(node)
         elif isinstance(node, ast_nodes.MapLiteralNode):
             return self._generate_map_literal(node)
+        elif isinstance(node, ast_nodes.ListElementAccessNode):
+            return self._generate_list_element_access(node)
         elif isinstance(node, ast_nodes.PropertyAccessNode):
-            target_name = node.target_expr.name if hasattr(node.target_expr, 'name') else type(node.target_expr).__name__
-            print(f"Warning: Direct generation of PropertyAccessNode '{target_name}.{node.property_name.name}' as expr value not fully implemented.")
-            return rt.create_null_value(self.current_builder)
+            return self._generate_property_access(node)
+        elif isinstance(node, ast_nodes.TernaryConditionalExpressionNode):
+            return self._generate_ternary_conditional_expression(node)
+        elif isinstance(node, ast_nodes.DollarParamNode):
+            return self._generate_dollar_param(node)
         else:
             raise NotImplementedError(f"Expression node type {type(node).__name__} not supported.")
 
     def _generate_list_literal(self, node: ast_nodes.ListLiteralNode) -> llvmlite.ir.Value:
-        if self.current_builder is None: raise RuntimeError("Builder not init.")
-        print("Warning: List literal generation not fully implemented. Calling runtime helper with no elements.")
-        runtime_func_name = "coral_runtime_create_list"
-        num_elements = llvmlite.ir.Constant(rt.IntegerType, 0)
-        elements_array_ptr_type = rt.ptr_to(rt.CoralValuePtrType)
-        elements_array_ptr = llvmlite.ir.Constant(elements_array_ptr_type, None)
-        func_ty = llvmlite.ir.FunctionType(rt.CoralValuePtrType, [elements_array_ptr_type, rt.IntegerType])
-        llvm_function = self.module.globals.get(runtime_func_name)
-        if llvm_function is None or not isinstance(llvm_function, llvmlite.ir.Function):
-            llvm_function = llvmlite.ir.Function(self.module, func_ty, name=runtime_func_name)
-        return self.current_builder.call(llvm_function, [elements_array_ptr, num_elements])
+        if self.current_builder is None or self.current_llvm_function is None:
+            raise RuntimeError("Builder or current_function not initialized for ListLiteralNode.")
+
+        num_elements = len(node.elements)
+        llvm_num_elements_i32 = llvmlite.ir.Constant(llvmlite.ir.IntType(32), num_elements)
+
+        elements_array_storage_ptr: llvmlite.ir.Value
+        if num_elements == 0:
+            elements_array_storage_ptr = llvmlite.ir.Constant(rt.ptr_to(rt.CoralValuePtrType), None)
+        else:
+            # Allocate stack space for an array of CoralValuePtrType (i.e., CoralValue**)
+            elements_array_alloca = self.current_builder.alloca(
+                rt.CoralValuePtrType,
+                size=llvm_num_elements_i32,
+                name="list_lit_elems_storage"
+            )
+
+            for i in range(num_elements):
+                element_ast = node.elements[i]
+                elem_val_ptr = self._generate_expression(element_ast) # This is CoralValue*
+
+                # Get pointer to the i-th slot in elements_array_alloca
+                # GEP needs an index of consistent type, using i32 here.
+                slot_ptr = self.current_builder.gep(
+                    elements_array_alloca,
+                    [llvmlite.ir.Constant(llvmlite.ir.IntType(32), i)],
+                    name=f"list_elem_slot_{i}_ptr"
+                )
+                self.current_builder.store(elem_val_ptr, slot_ptr)
+
+            elements_array_storage_ptr = elements_array_alloca # The alloca is already CoralValue**
+
+        # Declare or get the coral_runtime_create_list runtime function
+        func_name = "coral_runtime_create_list"
+        # Signature: CoralValue* coral_runtime_create_list(CoralValue** elements_array, i32 num_elements)
+        func_ty = llvmlite.ir.FunctionType(
+            rt.CoralValuePtrType,
+            [rt.ptr_to(rt.CoralValuePtrType), llvmlite.ir.IntType(32)]
+        )
+
+        create_list_func = self.module.globals.get(func_name)
+        if create_list_func is None or not isinstance(create_list_func, llvmlite.ir.Function):
+            create_list_func = llvmlite.ir.Function(self.module, func_ty, name=func_name)
+
+        new_list_ptr = self.current_builder.call(
+            create_list_func,
+            [elements_array_storage_ptr, llvm_num_elements_i32],
+            name="new_list_from_literal"
+        )
+        return new_list_ptr
+
+    def _generate_map_from_block(self, rhs_node: ast_nodes.MapBlockAssignmentRHSNode) -> llvmlite.ir.Value:
+        if self.current_builder is None or self.current_llvm_function is None:
+            raise RuntimeError("Builder or current_function not initialized for MapBlockAssignmentRHSNode.")
+
+        num_entries = len(rhs_node.entries)
+        llvm_num_entries_i32 = llvmlite.ir.Constant(llvmlite.ir.IntType(32), num_entries)
+
+        keys_array_ptr: llvmlite.ir.Value
+        values_array_ptr: llvmlite.ir.Value
+
+        if num_entries == 0:
+            keys_array_ptr = llvmlite.ir.Constant(rt.ptr_to(rt.CoralValuePtrType), None)
+            values_array_ptr = llvmlite.ir.Constant(rt.ptr_to(rt.CoralValuePtrType), None)
+        else:
+            keys_array_alloca = self.current_builder.alloca(
+                rt.CoralValuePtrType,
+                size=llvm_num_entries_i32,
+                name="map_block_keys_storage"
+            )
+            values_array_alloca = self.current_builder.alloca(
+                rt.CoralValuePtrType,
+                size=llvm_num_entries_i32,
+                name="map_block_vals_storage"
+            )
+
+            for i in range(num_entries):
+                map_block_entry_node = rhs_node.entries[i] # This is ast_nodes.MapBlockEntryNode
+
+                key_name_str = map_block_entry_node.key.name
+                key_coral_str_ptr = self._create_llvm_global_string_ptr(key_name_str, name_prefix=".str.map_key")
+                # Note: Map keys from blocks are also being created as global strings here.
+                # This is different from rt.create_string_value used in _generate_map_literal,
+                # which creates a Coral string *object*. For consistency with how map keys
+                # are handled by the runtime, it might be better to use rt.create_string_value.
+                # Let's adjust this to use rt.create_string_value for the key, like in _generate_map_literal.
+                key_coral_str_ptr = rt.create_string_value(self.current_builder, self.module, key_name_str)
+
+
+                value_coral_val_ptr = self._generate_expression(map_block_entry_node.value)
+
+                key_slot_ptr = self.current_builder.gep(
+                    keys_array_alloca,
+                    [llvmlite.ir.Constant(llvmlite.ir.IntType(32), i)],
+                    name=f"map_block_key_slot_{i}_ptr"
+                )
+                self.current_builder.store(key_coral_str_ptr, key_slot_ptr)
+
+                val_slot_ptr = self.current_builder.gep(
+                    values_array_alloca,
+                    [llvmlite.ir.Constant(llvmlite.ir.IntType(32), i)],
+                    name=f"map_block_val_slot_{i}_ptr"
+                )
+                self.current_builder.store(value_coral_val_ptr, val_slot_ptr)
+
+            keys_array_ptr = keys_array_alloca
+            values_array_ptr = values_array_alloca
+
+        func_name = "coral_runtime_create_map"
+        func_ty = llvmlite.ir.FunctionType(
+            rt.CoralValuePtrType,
+            [rt.ptr_to(rt.CoralValuePtrType), rt.ptr_to(rt.CoralValuePtrType), llvmlite.ir.IntType(32)]
+        )
+
+        create_map_func = self.module.globals.get(func_name)
+        if create_map_func is None or not isinstance(create_map_func, llvmlite.ir.Function):
+            create_map_func = llvmlite.ir.Function(self.module, func_ty, name=func_name)
+
+        new_map_ptr = self.current_builder.call(
+            create_map_func,
+            [keys_array_ptr, values_array_ptr, llvm_num_entries_i32],
+            name="new_map_from_block"
+        )
+        return new_map_ptr
 
     def _generate_map_literal(self, node: ast_nodes.MapLiteralNode) -> llvmlite.ir.Value:
-        if self.current_builder is None: raise RuntimeError("Builder not init.")
-        print("Warning: Map literal generation not fully implemented. Calling runtime helper with no entries.")
-        runtime_func_name = "coral_runtime_create_map"
-        num_entries = llvmlite.ir.Constant(rt.IntegerType, 0)
-        keys_array_ptr_type = rt.ptr_to(rt.CoralValuePtrType)
-        values_array_ptr_type = rt.ptr_to(rt.CoralValuePtrType)
-        keys_ptr = llvmlite.ir.Constant(keys_array_ptr_type, None)
-        values_ptr = llvmlite.ir.Constant(values_array_ptr_type, None)
-        func_ty = llvmlite.ir.FunctionType(rt.CoralValuePtrType, [keys_array_ptr_type, values_array_ptr_type, rt.IntegerType])
-        llvm_function = self.module.globals.get(runtime_func_name)
-        if llvm_function is None or not isinstance(llvm_function, llvmlite.ir.Function):
-            llvm_function = llvmlite.ir.Function(self.module, func_ty, name=runtime_func_name)
-        return self.current_builder.call(llvm_function, [keys_ptr, values_ptr, num_entries])
+        if self.current_builder is None or self.current_llvm_function is None:
+            raise RuntimeError("Builder or current_function not initialized for MapLiteralNode.")
+
+        num_entries = len(node.entries)
+        llvm_num_entries_i32 = llvmlite.ir.Constant(llvmlite.ir.IntType(32), num_entries)
+
+        keys_array_ptr: llvmlite.ir.Value
+        values_array_ptr: llvmlite.ir.Value
+
+        if num_entries == 0:
+            keys_array_ptr = llvmlite.ir.Constant(rt.ptr_to(rt.CoralValuePtrType), None)
+            values_array_ptr = llvmlite.ir.Constant(rt.ptr_to(rt.CoralValuePtrType), None)
+        else:
+            keys_array_alloca = self.current_builder.alloca(
+                rt.CoralValuePtrType,
+                size=llvm_num_entries_i32,
+                name="map_lit_keys_storage"
+            )
+            values_array_alloca = self.current_builder.alloca(
+                rt.CoralValuePtrType,
+                size=llvm_num_entries_i32,
+                name="map_lit_vals_storage"
+            )
+
+            for i in range(num_entries):
+                map_entry_node = node.entries[i] # This is ast_nodes.MapEntryNode
+
+                # Key IR (key is IdentifierNode, convert its name to Coral String Value)
+                key_name_str = map_entry_node.key.name
+                # rt.create_string_value needs builder, module, and python string
+                key_coral_str_ptr = rt.create_string_value(self.current_builder, self.module, key_name_str)
+
+                # Value IR
+                value_coral_val_ptr = self._generate_expression(map_entry_node.value)
+
+                # Store key
+                key_slot_ptr = self.current_builder.gep(
+                    keys_array_alloca,
+                    [llvmlite.ir.Constant(llvmlite.ir.IntType(32), i)],
+                    name=f"map_key_slot_{i}_ptr"
+                )
+                self.current_builder.store(key_coral_str_ptr, key_slot_ptr)
+
+                # Store value
+                val_slot_ptr = self.current_builder.gep(
+                    values_array_alloca,
+                    [llvmlite.ir.Constant(llvmlite.ir.IntType(32), i)],
+                    name=f"map_val_slot_{i}_ptr"
+                )
+                self.current_builder.store(value_coral_val_ptr, val_slot_ptr)
+
+            keys_array_ptr = keys_array_alloca
+            values_array_ptr = values_array_alloca
+
+        # Declare or get the coral_runtime_create_map runtime function
+        func_name = "coral_runtime_create_map"
+        # Signature: CoralValue* coral_runtime_create_map(CoralValue** keys, CoralValue** values, i32 num_entries)
+        func_ty = llvmlite.ir.FunctionType(
+            rt.CoralValuePtrType,
+            [rt.ptr_to(rt.CoralValuePtrType), rt.ptr_to(rt.CoralValuePtrType), llvmlite.ir.IntType(32)]
+        )
+
+        create_map_func = self.module.globals.get(func_name)
+        if create_map_func is None or not isinstance(create_map_func, llvmlite.ir.Function):
+            create_map_func = llvmlite.ir.Function(self.module, func_ty, name=func_name)
+
+        new_map_ptr = self.current_builder.call(
+            create_map_func,
+            [keys_array_ptr, values_array_ptr, llvm_num_entries_i32],
+            name="new_map_from_literal"
+        )
+        return new_map_ptr
+
+    def _generate_list_element_access(self, node: ast_nodes.ListElementAccessNode) -> llvmlite.ir.Value:
+        if self.current_builder is None or self.current_llvm_function is None:
+            raise RuntimeError("Builder or current_function not initialized for list element access.")
+
+        base_val_ptr = self._generate_expression(node.base_expr)
+        index_val_ptr = self._generate_expression(node.index_expr)
+
+        func_name = "coral_runtime_list_get_element"
+        func_ty = llvmlite.ir.FunctionType(rt.CoralValuePtrType, [rt.CoralValuePtrType, rt.CoralValuePtrType])
+
+        get_elem_func = self.module.globals.get(func_name)
+        if get_elem_func is None or not isinstance(get_elem_func, llvmlite.ir.Function):
+            get_elem_func = llvmlite.ir.Function(self.module, func_ty, name=func_name)
+
+        element_ptr = self.current_builder.call(get_elem_func, [base_val_ptr, index_val_ptr], name="list_elem_ptr")
+        return element_ptr
+
+    def _generate_property_access(self, node: ast_nodes.PropertyAccessNode) -> llvmlite.ir.Value:
+        if self.current_builder is None or self.current_llvm_function is None:
+            raise RuntimeError("Builder or current_function not initialized for property access.")
+
+        base_val_ptr = self._generate_expression(node.base_expr)
+        property_name_str = node.property_name.name
+
+        prop_name_ptr = self._create_llvm_global_string_ptr(property_name_str, name_prefix=".str.prop_name")
+
+        # Declare or get coral_runtime_object_get_property
+        func_name = "coral_runtime_object_get_property"
+        # Signature: CoralValue* (CoralValue* obj_ptr, i8* prop_name_ptr)
+        func_ty = llvmlite.ir.FunctionType(rt.CoralValuePtrType, [rt.CoralValuePtrType, llvmlite.ir.PointerType(llvmlite.ir.IntType(8))])
+
+        get_prop_func = self.module.globals.get(func_name)
+        if get_prop_func is None or not isinstance(get_prop_func, llvmlite.ir.Function):
+            get_prop_func = llvmlite.ir.Function(self.module, func_ty, name=func_name)
+
+        property_val_ptr = self.current_builder.call(get_prop_func, [base_val_ptr, prop_name_ptr], name="prop_val_ptr")
+        return property_val_ptr
+
+    def _generate_ternary_conditional_expression(self, node: ast_nodes.TernaryConditionalExpressionNode) -> llvmlite.ir.Value:
+        if self.current_builder is None or self.current_llvm_function is None:
+            raise RuntimeError("Builder or current_function not initialized for ternary conditional expression.")
+
+        current_llvm_func = self.current_llvm_function
+
+        condition_val_ptr = self._generate_expression(node.condition)
+        boolean_condition = rt.get_boolean_value(self.current_builder, condition_val_ptr, current_llvm_func)
+
+        then_block = current_llvm_func.append_basic_block(name="ternary.then")
+        else_block = current_llvm_func.append_basic_block(name="ternary.else")
+        merge_block = current_llvm_func.append_basic_block(name="ternary.merge")
+
+        self.current_builder.cbranch(boolean_condition, then_block, else_block)
+
+        # Then Block
+        self.current_builder.position_at_end(then_block)
+        then_val_ptr = self._generate_expression(node.true_expr)
+        # then_val_origin_block is the block self.current_builder is positioned in *after* true_expr is generated.
+        # This is the block that will (potentially) branch to merge_block.
+        then_val_origin_block = self.current_builder.block
+        if not then_block.is_terminated: # Check the original then_block for termination
+            self.current_builder.branch(merge_block)
+
+        # Else Block
+        self.current_builder.position_at_end(else_block)
+        else_val_ptr = self._generate_expression(node.false_expr)
+        # else_val_origin_block is the block self.current_builder is positioned in *after* false_expr is generated.
+        else_val_origin_block = self.current_builder.block
+        if not else_block.is_terminated: # Check the original else_block for termination
+            self.current_builder.branch(merge_block)
+
+        # Merge Block
+        self.current_builder.position_at_end(merge_block)
+
+        # If merge_block has no predecessors, it means both branches of the ternary
+        # always return or branch elsewhere. A PHI node here would be ill-formed.
+        # This check ensures we only create a PHI if it's meaningful.
+        if not merge_block.predecessors:
+            # This situation is complex: an expression is expected to yield a value,
+            # but if both paths diverge, there's no single value.
+            # LLVM's 'unreachable' instruction might be appropriate if the code path itself is unreachable.
+            # For now, we'll proceed to create the PHI, and LLVM's verifier will catch issues
+            # if merge_block truly has no predecessors. In a well-formed program, a ternary
+            # expression that is *used* should have its merge_block reachable.
+            # If it's not used, it might be optimized out.
+            # A more robust solution might involve checking if then_val_origin_block and
+            # else_val_origin_block actually branch to merge_block before adding them to PHI.
+            # However, the standard PHI construction relies on the CFG being correctly formed
+            # such that only actual predecessors are added.
+            pass # Allow PHI creation, LLVM will verify.
+
+        phi_node = self.current_builder.phi(rt.CoralValuePtrType, name="ternary.val")
+
+        # Add incoming values. It's crucial that then_val_origin_block and else_val_origin_block
+        # are the blocks that are actual predecessors to merge_block in the CFG.
+        # The branches added above ensure this if the paths don't terminate early.
+        # If a path *does* terminate early (e.g., true_expr contains a 'return'),
+        # then its corresponding origin_block will not be a predecessor of merge_block,
+        # and LLVM's PHI verification will complain if we try to add it.
+        # So, we should only add incoming branches that actually exist.
+
+        # A simple way:
+        # For a PHI node in block B, for each predecessor P of B, there must be one incoming value from P.
+        # So, iterate over merge_block.predecessors.
+        # This is safer.
+
+        processed_predecessors = set()
+        if then_val_origin_block in merge_block.predecessors and then_val_origin_block not in processed_predecessors:
+            phi_node.add_incoming(then_val_ptr, then_val_origin_block)
+            processed_predecessors.add(then_val_origin_block)
+
+        if else_val_origin_block in merge_block.predecessors and else_val_origin_block not in processed_predecessors:
+             phi_node.add_incoming(else_val_ptr, else_val_origin_block)
+             processed_predecessors.add(else_val_origin_block)
+
+        # If, after all this, phi_node has no incoming values (e.g., if _generate_expression
+        # for true/false_expr led to new blocks that branched away, and the original then/else blocks
+        # didn't get their branch to merge_block, or if both paths returned), then the phi is invalid.
+        # This indicates a potentially ill-formed ternary in the source or complex control flow
+        # within the ternary expressions not suitable for a simple PHI.
+        # For typical ternaries, the two simple add_incoming calls are sufficient:
+        # phi_node.add_incoming(then_val_ptr, then_val_origin_block)
+        # phi_node.add_incoming(else_val_ptr, else_val_origin_block)
+        # The checks `if not then_block.is_terminated:` / `if not else_block.is_terminated:`
+        # are designed to ensure that `then_val_origin_block` and `else_val_origin_block`
+        # (if those paths don't return) do indeed branch to `merge_block`.
+
+        # Given the structure, then_val_origin_block is the block that *contains* the branch if one is added.
+        # Same for else_val_origin_block. So these are the correct blocks to reference.
+
+        # Sticking to the direct approach as per initial plan, assuming valid ternary use:
+        # If a branch does not reach the merge block, it should not be added.
+        # The construction `if not then_block.is_terminated: self.current_builder.branch(merge_block)`
+        # ensures that `then_val_origin_block` (which is `self.current_builder.block` at that point)
+        # *will* be a predecessor if that path is taken and doesn't return.
+        # So, the direct add_incoming calls are robust under this assumption.
+
+        # Clearer PHI population:
+        # Check if then_val_origin_block actually branches to merge_block.
+        # This is true if then_block (the original BB) was not terminated by node.true_expr,
+        # thus received a branch to merge_block.
+        if then_val_origin_block.terminator and any(succ == merge_block for succ in then_val_origin_block.terminator.successors):
+             phi_node.add_incoming(then_val_ptr, then_val_origin_block)
+        # If node.true_expr itself returned, then_block would be terminated, and this path wouldn't go to merge_block.
+
+        if else_val_origin_block.terminator and any(succ == merge_block for succ in else_val_origin_block.terminator.successors):
+            phi_node.add_incoming(else_val_ptr, else_val_origin_block)
+
+        # If after these checks, phi_node has no incoming branches, it implies an issue.
+        # For a standard ternary expression, we expect two incoming branches.
+        # If phi_node.is_empty and merge_block.predecessors: # Problem!
+        # If phi_node.is_empty and not merge_block.predecessors: # Merge block is dead, what to return?
+            # This path is problematic. An expression must yield a value.
+            # If the merge block is unreachable, the value of the expression is undefined in this path.
+            # This could happen if both true and false expressions always return.
+            # In such a case, the code after the ternary is also unreachable.
+            # For now, we assume the ternary is used in a context where its value is needed.
+            # If phi_node has 0 incoming values, it's an invalid PHI.
+            # Let's revert to the simplest form, relying on LLVM verification for now.
+            # phi_node.add_incoming(then_val_ptr, then_val_origin_block)
+            # phi_node.add_incoming(else_val_ptr, else_val_origin_block)
+            # This was the original plan and is standard if the CFG is built correctly.
+            # The checks for `is_terminated` on `then_block` and `else_block` (the original ones)
+            # ensure that the branches to `merge_block` are added from `then_val_origin_block`
+            # and `else_val_origin_block` respectively, if those paths don't have early exits.
+
+        # Final simplified version based on initial plan:
+        phi_node.add_incoming(then_val_ptr, then_val_origin_block)
+        phi_node.add_incoming(else_val_ptr, else_val_origin_block)
+
+
+        return phi_node
+
+    def _generate_dollar_param(self, node: ast_nodes.DollarParamNode) -> llvmlite.ir.Value:
+        if self.current_builder is None or self.current_llvm_function is None:
+            raise RuntimeError("Builder or current_function not initialized for DollarParamNode.")
+
+        if isinstance(node.name_or_index, str):
+            param_name_str = node.name_or_index
+            name_ptr = self._create_llvm_global_string_ptr(param_name_str, name_prefix=".str.dollar_param")
+
+            func_name = "coral_runtime_get_dollar_param_by_name"
+            func_ty = llvmlite.ir.FunctionType(rt.CoralValuePtrType, [llvmlite.ir.PointerType(llvmlite.ir.IntType(8))])
+            get_param_func = self.module.globals.get(func_name)
+            if get_param_func is None or not isinstance(get_param_func, llvmlite.ir.Function):
+                get_param_func = llvmlite.ir.Function(self.module, func_ty, name=func_name)
+
+            param_val_ptr = self.current_builder.call(get_param_func, [name_ptr], name=f"dollar_param_{param_name_str}")
+
+        elif isinstance(node.name_or_index, int):
+            param_index_int = node.name_or_index
+            index_llvm_int = llvmlite.ir.Constant(rt.IntegerType, param_index_int) # rt.IntegerType is i64
+
+            func_name = "coral_runtime_get_dollar_param_by_index"
+            func_ty = llvmlite.ir.FunctionType(rt.CoralValuePtrType, [rt.IntegerType]) # Expects i64
+            get_param_func = self.module.globals.get(func_name)
+            if get_param_func is None or not isinstance(get_param_func, llvmlite.ir.Function):
+                get_param_func = llvmlite.ir.Function(self.module, func_ty, name=func_name)
+
+            param_val_ptr = self.current_builder.call(get_param_func, [index_llvm_int], name=f"dollar_param_{param_index_int}")
+
+        else:
+            raise TypeError(f"DollarParamNode has unexpected name_or_index type: {type(node.name_or_index)}")
+
+        return param_val_ptr
 
     def _generate_call_operation(self, node: ast_nodes.CallOperationNode) -> llvmlite.ir.Value:
         if self.current_builder is None or self.current_llvm_function is None:
@@ -185,21 +668,23 @@ class IRGenerator:
             print(f"Warning: Callee type {type(node.callee).__name__} not supported for standard calls. Returning null.")
             return rt.create_null_value(self.current_builder)
 
-        func_name = node.callee.name
+        original_func_name = node.callee.name
+        mangled_callee_name = self._get_mangled_name(original_func_name)
+
         generated_args = [self._generate_expression(arg) for arg in node.arguments] if node.arguments else []
         if node.call_style != ast_nodes.CallStyle.FUNCTION:
-            print(f"Warning: Call style '{node.call_style}' for '{func_name}' not fully supported.")
+            print(f"Warning: Call style '{node.call_style}' for '{mangled_callee_name}' not fully supported.")
 
-        llvm_function = self.module.globals.get(func_name)
+        llvm_function = self.module.globals.get(mangled_callee_name)
         if llvm_function is None or not isinstance(llvm_function, llvmlite.ir.Function):
-            print(f"Warning: Function '{func_name}' not found. Declaring with assumed signature.")
+            print(f"Warning: Function '{mangled_callee_name}' not found. Declaring with assumed signature.")
             arg_types = [rt.CoralValuePtrType] * len(generated_args)
             func_type = llvmlite.ir.FunctionType(rt.CoralValuePtrType, arg_types)
-            llvm_function = llvmlite.ir.Function(self.module, func_type, name=func_name)
+            llvm_function = llvmlite.ir.Function(self.module, func_type, name=mangled_callee_name)
 
         if len(llvm_function.args) != len(generated_args):
-            raise ValueError(f"Call to '{func_name}': {len(generated_args)} args, expects {len(llvm_function.args)}.")
-        return self.current_builder.call(llvm_function, generated_args, name=f"call_{func_name}")
+            raise ValueError(f"Call to '{mangled_callee_name}': {len(generated_args)} args, expects {len(llvm_function.args)}.")
+        return self.current_builder.call(llvm_function, generated_args, name=f"call_{mangled_callee_name}")
 
     def _generate_unary_op(self, node: ast_nodes.UnaryOpNode) -> llvmlite.ir.Value:
         # ... (implementation as before, using self.current_builder, self.current_llvm_function)
@@ -313,44 +798,120 @@ class IRGenerator:
             self._generate_object_definition(stmt_node)
         elif isinstance(stmt_node, ast_nodes.StoreDefinitionNode):
             self._generate_store_definition(stmt_node)
+        elif isinstance(stmt_node, ast_nodes.ModuleDefinitionNode):
+            self._generate_module_definition(stmt_node)
         else:
             print(f"Warning: Statement type {type(stmt_node).__name__} not handled by _generate_statement.")
 
     def _generate_object_definition(self, node: ast_nodes.ObjectDefinitionNode):
-        print(f"Info: Processing object definition for '{node.name.name}'. Methods will be defined as mangled functions.")
-        for member in node.members:
-            if isinstance(member, ast_nodes.FieldDefinitionNode):
-                self._generate_field_definition(member, obj_name=node.name.name)
-            elif isinstance(member, ast_nodes.MethodDefinitionNode):
-                self._generate_method_definition(member, obj_name=node.name.name)
+        obj_name = node.name.name
+        # The mangled name for print should reflect its definition context if within a module
+        # For example, if obj TestObj is in module ModA, it's ModA_TestObj
+        # self._get_mangled_name(obj_name) would achieve this if obj_name is not yet in prefix.
+        # However, for messages, the simple name is often fine, and methods will show full path.
+        # Let's keep the simple name for the "Processing object definition" message.
+        print(f"Info: Processing object definition for '{obj_name}'. Methods will be defined as mangled functions.")
 
-    def _generate_field_definition(self, node: ast_nodes.FieldDefinitionNode, obj_name: str):
-        print(f"Info: Field definition '{node.name.name}' in object '{obj_name}' noted. IR generation deferred.")
+        self.current_module_prefix.append(obj_name)
+        try:
+            for member in node.members:
+                if isinstance(member, ast_nodes.FieldDefinitionNode):
+                    # Pass the simple object name; _generate_field_definition will query full prefix
+                    self._generate_field_definition(member, owner_name=obj_name)
+                elif isinstance(member, ast_nodes.MethodDefinitionNode):
+                    # Pass the simple object name; _generate_method_definition will query full prefix
+                    self._generate_method_definition(member, obj_name=obj_name)
+        finally:
+            if self.current_module_prefix and self.current_module_prefix[-1] == obj_name:
+                self.current_module_prefix.pop()
+
+
+    def _generate_field_definition(self, node: ast_nodes.FieldDefinitionNode, owner_name: str):
+        # owner_name is the simple name of the object or store
+        full_owner_name = self._get_mangled_name(owner_name) # This will apply module_prefix + owner_name
+
+        base_msg = f"Info: Field definition '{node.name.name}' in owner '{full_owner_name}' noted."
+
+        if node.default_value is not None:
+            # In a full implementation, self._generate_expression(node.default_value) would be called here.
+            print(f"{base_msg} (with default value). Full IR generation for field storage and initialization deferred.")
+        else:
+            print(f"{base_msg} Full IR generation for field storage deferred.")
+
+    def _generate_relation_definition(self, node: ast_nodes.RelationDefinitionNode, owner_name: str):
+        current_context_name = self._get_mangled_name(owner_name)
+        # Assuming node.name is an IdentifierNode or similar with a .name attribute
+        relation_name = node.name.name if hasattr(node.name, 'name') else str(node.name)
+        print(f"Info: Relation definition '{relation_name}' in owner '{current_context_name}' noted. IR generation deferred.")
+
+    def _generate_cast_definition(self, node: ast_nodes.CastDefinitionNode, owner_name: str):
+        current_context_name = self._get_mangled_name(owner_name)
+        cast_to_type_str = node.cast_to_type.name if hasattr(node.cast_to_type, 'name') else str(node.cast_to_type)
+        print(f"Info: Cast definition to type '{cast_to_type_str}' in owner '{current_context_name}' noted. IR generation deferred.")
+
+    def _generate_receive_handler(self, node: ast_nodes.ReceiveHandlerNode, owner_name: str):
+        current_context_name = self._get_mangled_name(owner_name)
+        # Assuming node.message_name is an IdentifierNode or similar
+        message_name_str = node.message_name.name if hasattr(node.message_name, 'name') else str(node.message_name)
+        print(f"Info: Receive handler for message '{message_name_str}' in owner '{current_context_name}' noted. IR generation deferred.")
 
     def _generate_method_definition(self, node: ast_nodes.MethodDefinitionNode, obj_name: str):
-        mangled_name = f"{obj_name}_{node.name.name}"
-        print(f"Info: Defining method '{node.name.name}' of '{obj_name}' as function '{mangled_name}'.")
+        intermediate_mangled_method_name = f"{obj_name}_{node.name.name}"
+        # Now, apply the module prefix to this intermediate name
+        final_llvm_name = self._get_mangled_name(intermediate_mangled_method_name)
+        print(f"Info: Defining method '{node.name.name}' of '{obj_name}' (obj part: {intermediate_mangled_method_name}) as LLVM function '{final_llvm_name}'.")
         synthetic_func_node = ast_nodes.FunctionDefinitionNode(
-            name=ast_nodes.IdentifierNode(mangled_name, token_details=node.name.token_details),
+            name=ast_nodes.IdentifierNode(final_llvm_name, token_details=node.name.token_details),
             params=node.params, body=node.body, token_details=node.token_details)
         self._generate_function_definition(synthetic_func_node)
 
     def _generate_store_definition(self, node: ast_nodes.StoreDefinitionNode):
         store_name = node.name.name
-        print(f"Warning: Store definition for '{store_name}' not fully implemented. Methods processed.")
-        if hasattr(node, 'members') and node.members:
-             for member in node.members:
-                if isinstance(member, ast_nodes.MethodDefinitionNode):
-                    mangled_name = f"{store_name}_{member.name.name}"
-                    print(f"Info: Defining store method '{member.name.name}' as function '{mangled_name}'.")
-                    synthetic_func_node = ast_nodes.FunctionDefinitionNode(
-                        name=ast_nodes.IdentifierNode(mangled_name, token_details=member.name.token_details),
-                        params=member.params, body=member.body, token_details=member.token_details)
-                    self._generate_function_definition(synthetic_func_node)
-                elif isinstance(member, (ast_nodes.RelationDefinitionNode, ast_nodes.CastDefinitionNode, ast_nodes.ReceiveDefinitionNode, ast_nodes.FieldDefinitionNode)):
-                    print(f"Info: Store member type {type(member).__name__} in '{store_name}' noted. IR deferred.")
-                else:
-                    print(f"Warning: Unsupported member type {type(member).__name__} in store '{store_name}'.")
+        # Using simple store_name for top-level messages about the store itself.
+        # Mangled names will appear for its members via their respective generators.
+        print(f"Info: Processing store definition for '{store_name}'.")
+
+        if node.is_actor:
+            print(f"Info: Store '{store_name}' is an actor.")
+        if node.for_target:
+            # Assuming node.for_target is an IdentifierNode or similar with a .name
+            target_name = node.for_target.name if hasattr(node.for_target, 'name') else str(node.for_target)
+            print(f"Info: Store '{store_name}' is for target '{target_name}'.")
+
+        self.current_module_prefix.append(store_name)
+        try:
+            if hasattr(node, 'members') and node.members:
+                 for member in node.members:
+                    if isinstance(member, ast_nodes.MethodDefinitionNode):
+                        # _generate_method_definition uses obj_name (store_name here)
+                        # and _get_mangled_name internally handles the full prefix.
+                        self._generate_method_definition(member, obj_name=store_name)
+                    elif isinstance(member, ast_nodes.FieldDefinitionNode):
+                        self._generate_field_definition(member, owner_name=store_name)
+                    elif isinstance(member, ast_nodes.RelationDefinitionNode):
+                        self._generate_relation_definition(member, owner_name=store_name)
+                    elif isinstance(member, ast_nodes.CastDefinitionNode):
+                        self._generate_cast_definition(member, owner_name=store_name)
+                    elif isinstance(member, ast_nodes.ReceiveHandlerNode): # Based on task spec for ReceiveHandlerNode
+                        self._generate_receive_handler(member, owner_name=store_name)
+                    # Check if ast_nodes.ReceiveDefinitionNode is a distinct type that also needs handling.
+                    # My previous analysis showed ast_nodes.ReceiveDefinitionNode for store members.
+                    # The task spec specifically asks for ReceiveHandlerNode. Trusting task spec.
+                    elif isinstance(member, ast_nodes.ReceiveDefinitionNode): # Handling this just in case
+                        # This assumes ReceiveDefinitionNode has a 'message_name' like ReceiveHandlerNode
+                        # or needs adaptation. For now, let's assume it's similar enough or covered by Handler.
+                        # If they are different, a separate handler or logic is needed.
+                        # For this pass, if it's ReceiveDefinitionNode and not ReceiveHandlerNode, it will go to else.
+                        # This can be refined if both types are distinct and appear in stores.
+                        print(f"Info: Encountered ReceiveDefinitionNode '{member.message_name.name if hasattr(member, 'message_name') else 'UnknownMsg'}' - using receive_handler logic.")
+                        self._generate_receive_handler(member, owner_name=store_name) # Attempt to use same handler
+                    else:
+                        print(f"Warning: Unsupported member type {type(member).__name__} in store '{store_name}'.")
+            else:
+                print(f"Info: Store '{store_name}' has no members.")
+        finally:
+            if self.current_module_prefix and self.current_module_prefix[-1] == store_name:
+                self.current_module_prefix.pop()
 
     def _generate_error_handler_suffix(self, node: ast_nodes.ErrorHandlerSuffixNode, expression_value: llvmlite.ir.Value) -> llvmlite.ir.Value:
         error_var_name = node.error_variable.name if node.error_variable else "_"
@@ -373,17 +934,18 @@ class IRGenerator:
             self.current_builder.ret(null_coral_val)
 
     def _generate_function_definition(self, node: ast_nodes.FunctionDefinitionNode):
-        # ... (implementation as before, using self.current_builder, self.current_llvm_function, self.current_symbol_table)
-        func_name = node.name.name
+        original_func_name = node.name.name
+        mangled_func_name = self._get_mangled_name(original_func_name)
+
         outer_builder = self.current_builder
         outer_llvm_function = self.current_llvm_function
         outer_symbol_table = self.current_symbol_table
         param_types = [rt.CoralValuePtrType] * len(node.params)
         return_type = rt.CoralValuePtrType
         func_type = llvmlite.ir.FunctionType(return_type, param_types)
-        llvm_func = Function(self.module, func_type, name=func_name)
+        llvm_func = Function(self.module, func_type, name=mangled_func_name) # Use mangled name
         self.current_llvm_function = llvm_func
-        self.current_symbol_table = {}
+        self.current_symbol_table = {} # Functions have their own local symbol table for params/vars
         entry_block = llvm_func.append_basic_block(name="entry")
         self.current_builder = IRBuilder(entry_block)
         for i, param_node in enumerate(node.params):
@@ -397,7 +959,7 @@ class IRGenerator:
         # Process body (assuming node.body is a list of statements)
         if not isinstance(node.body, list): # Check if body is a single expression node (older AST?)
              if isinstance(node.body, ast_nodes.ExpressionNode):
-                print(f"Warning: Single expression body for func '{func_name}' - wrapping in return.")
+                print(f"Warning: Single expression body for func '{mangled_func_name}' - wrapping in return.")
                 # This might be too simplistic; depends on how parser creates FunctionDefinitionNode.body
                 # If it's an ExpressionNode, it should be wrapped in a ReturnStatementNode for explicit return.
                 # For now, assume parser creates a list of statements for body.
@@ -408,7 +970,7 @@ class IRGenerator:
              elif node.body is None: # No body
                  pass # Will fall through to default null return
              else: # Not an ExpressionNode and not a list
-                 print(f"Error: Unsupported function body type for '{func_name}': {type(node.body)}. Expecting list of statements.")
+                 print(f"Error: Unsupported function body type for '{mangled_func_name}': {type(node.body)}. Expecting list of statements.")
                  self._generate_statement_list([]) # Effectively empty body
         else: # node.body is a list
             self._generate_statement_list(node.body)
@@ -420,7 +982,7 @@ class IRGenerator:
             elif str(return_type) == "void":
                  self.current_builder.ret_void()
             else:
-                print(f"Warning: Func '{func_name}' non-void, lacks return. LLVM might error.")
+                print(f"Warning: Func '{mangled_func_name}' non-void, lacks return. LLVM might error.")
         self.current_llvm_function = outer_llvm_function
         self.current_symbol_table = outer_symbol_table
         self.current_builder = outer_builder
@@ -444,6 +1006,183 @@ class IRGenerator:
         if not self.current_builder.block.is_terminated:
             self.current_builder.branch(loop_header_block)
         self.current_builder.position_at_end(loop_exit_block)
+
+    def _generate_iterate_loop(self, node: ast_nodes.IterateLoopNode):
+        if self.current_builder is None or self.current_llvm_function is None:
+            raise RuntimeError("Builder or current_function not initialized for iterate loop.")
+
+        current_llvm_func = self.current_llvm_function
+
+        # Initialization
+        iterable_val_ptr = self._generate_expression(node.iterable)
+
+        # Declare or get coral_runtime_iterate_start
+        func_ty_iter_start = llvmlite.ir.FunctionType(rt.CoralValuePtrType, [rt.CoralValuePtrType])
+        iter_start_func = self.module.globals.get("coral_runtime_iterate_start")
+        if iter_start_func is None or not isinstance(iter_start_func, llvmlite.ir.Function):
+            iter_start_func = llvmlite.ir.Function(self.module, func_ty_iter_start, name="coral_runtime_iterate_start")
+        iterator_state_ptr = self.current_builder.call(iter_start_func, [iterable_val_ptr], name="iter_state")
+
+        # Create Blocks
+        loop_header_block = current_llvm_func.append_basic_block(name="iter.header")
+        loop_body_block = current_llvm_func.append_basic_block(name="iter.body")
+        loop_exit_block = current_llvm_func.append_basic_block(name="iter.exit")
+
+        if not self.current_builder.block.is_terminated:
+            self.current_builder.branch(loop_header_block)
+
+        # Loop Header
+        self.current_builder.position_at_end(loop_header_block)
+        # Declare or get coral_runtime_iterate_has_next
+        func_ty_has_next = llvmlite.ir.FunctionType(rt.CoralValuePtrType, [rt.CoralValuePtrType])
+        iter_has_next_func = self.module.globals.get("coral_runtime_iterate_has_next")
+        if iter_has_next_func is None or not isinstance(iter_has_next_func, llvmlite.ir.Function):
+            iter_has_next_func = llvmlite.ir.Function(self.module, func_ty_has_next, name="coral_runtime_iterate_has_next")
+        has_next_coral_val_ptr = self.current_builder.call(iter_has_next_func, [iterator_state_ptr], name="iter_has_next")
+        boolean_has_next = rt.get_boolean_value(self.current_builder, has_next_coral_val_ptr, current_llvm_func)
+        self.current_builder.cbranch(boolean_has_next, loop_body_block, loop_exit_block)
+
+        # Loop Body
+        self.current_builder.position_at_end(loop_body_block)
+        # Declare or get coral_runtime_iterate_next
+        func_ty_next = llvmlite.ir.FunctionType(rt.CoralValuePtrType, [rt.CoralValuePtrType])
+        iter_next_func = self.module.globals.get("coral_runtime_iterate_next")
+        if iter_next_func is None or not isinstance(iter_next_func, llvmlite.ir.Function):
+            iter_next_func = llvmlite.ir.Function(self.module, func_ty_next, name="coral_runtime_iterate_next")
+        current_element_ptr = self.current_builder.call(iter_next_func, [iterator_state_ptr], name="iter_elem")
+
+        if node.loop_variable:
+            var_name = node.loop_variable.name
+            var_storage_ptr = self._get_variable_storage(var_name)
+            if var_storage_ptr is None:
+                # Allocate in function entry block for simplicity
+                # Ensure entry block has a builder positioned correctly, or create one temporarily
+                original_block = self.current_builder.block
+                original_debug_loc = self.current_builder.debug_loc
+
+                entry_b = current_llvm_func.entry_basic_block
+                if not entry_b.instructions:
+                    entry_builder = llvmlite.ir.IRBuilder(entry_b)
+                else:
+                    # Position builder before the first instruction that is not an alloca
+                    # This is a common pattern for allocas
+                    first_instr_not_alloca = next((instr for instr in entry_b.instructions if not isinstance(instr, llvmlite.ir.AllocaInstr)), None)
+                    if first_instr_not_alloca:
+                        entry_builder = llvmlite.ir.IRBuilder(entry_b)
+                        entry_builder.position_before(first_instr_not_alloca)
+                    else: # block only has allocas or is empty
+                        entry_builder = llvmlite.ir.IRBuilder(entry_b)
+                        if entry_b.instructions: # has allocas
+                             entry_builder.position_after(entry_b.instructions[-1])
+                        # else it's empty, builder is at the start
+
+                var_storage_ptr = entry_builder.alloca(rt.CoralValuePtrType, name=f"{var_name}_iter_storage")
+                self._set_variable_storage(var_name, var_storage_ptr)
+
+                # Restore builder if it was moved for entry block insertion
+                if original_block:
+                    self.current_builder.position_at_end(original_block)
+                    self.current_builder.debug_loc = original_debug_loc
+
+
+            self.current_builder.store(current_element_ptr, var_storage_ptr)
+
+        body_stmts = node.body if isinstance(node.body, list) else [node.body]
+        self._generate_statement_list(body_stmts)
+
+        if not self.current_builder.block.is_terminated:
+            self.current_builder.branch(loop_header_block)
+
+        # Loop Exit
+        self.current_builder.position_at_end(loop_exit_block)
+        # Optional: Call coral_runtime_iterate_end(iterator_state_ptr) here
+
+    def _generate_until_loop(self, node: ast_nodes.UntilLoopNode):
+        if self.current_builder is None or self.current_llvm_function is None:
+            raise RuntimeError("Builder or current_function not initialized for until loop.")
+
+        current_llvm_func = self.current_llvm_function
+
+        loop_header_block = current_llvm_func.append_basic_block(name="until.header")
+        loop_body_block = current_llvm_func.append_basic_block(name="until.body")
+        loop_exit_block = current_llvm_func.append_basic_block(name="until.exit")
+
+        if not self.current_builder.block.is_terminated:
+            self.current_builder.branch(loop_header_block)
+
+        self.current_builder.position_at_end(loop_header_block)
+        condition_val_ptr = self._generate_expression(node.condition)
+        boolean_condition_val = rt.get_boolean_value(self.current_builder, condition_val_ptr, current_llvm_func)
+        # If condition is true, exit loop; if false, go to body.
+        self.current_builder.cbranch(boolean_condition_val, loop_exit_block, loop_body_block)
+
+        self.current_builder.position_at_end(loop_body_block)
+        # Ensure node.body is a list for _generate_statement_list
+        body_stmts = node.body if isinstance(node.body, list) else [node.body]
+        self._generate_statement_list(body_stmts)
+
+        if not self.current_builder.block.is_terminated:
+            self.current_builder.branch(loop_header_block)
+
+        self.current_builder.position_at_end(loop_exit_block)
+
+    def _generate_use_statement(self, node: ast_nodes.UseStatementNode):
+        qname_parts = [part.name for part in node.qualified_identifier.parts]
+        qname_str = ".".join(qname_parts)
+
+        alias_str = ""
+        if node.alias:
+            alias_str = f" as {node.alias.name}"
+
+        print(f"Info: 'use {qname_str}{alias_str}' encountered. Full import/namespacing beyond current module name mangling is not yet implemented.")
+        # No LLVM IR generation for 'use' statements at this stage.
+        # Future work would involve managing symbol tables, aliases, and possibly loading other modules.
+
+    def _generate_empty_statement(self, node: ast_nodes.EmptyStatementNode):
+        # Empty statements generate no IR.
+        # print(f"Debug: Generating IR for EmptyStatementNode at {node.location_info}") # Optional debug
+        pass
+
+    def _generate_module_definition(self, node: ast_nodes.ModuleDefinitionNode):
+        self.current_module_prefix.append(node.name.name)
+        try:
+            self._generate_statement_list(node.body)
+        finally:
+            # Ensure prefix is popped even if an error occurs in module body generation
+            if self.current_module_prefix and self.current_module_prefix[-1] == node.name.name:
+                self.current_module_prefix.pop()
+            # else: # Should not happen if append/pop are balanced
+            #     print(f"Warning: Module prefix stack imbalance when leaving module {node.name.name}")
+
+
+    def _generate_unless_statement(self, node: ast_nodes.UnlessStatementNode):
+        if self.current_builder is None or self.current_llvm_function is None:
+            raise RuntimeError("Builder or current_function not initialized for unless statement.")
+
+        current_llvm_func = self.current_llvm_function
+
+        body_block = current_llvm_func.append_basic_block(name="unless.body")
+        end_block = current_llvm_func.append_basic_block(name="unless.end")
+
+        condition_val_ptr = self._generate_expression(node.condition)
+        boolean_condition_val = rt.get_boolean_value(self.current_builder, condition_val_ptr, current_llvm_func)
+
+        # If condition is true, go to end_block; if false, go to body_block.
+        self.current_builder.cbranch(boolean_condition_val, end_block, body_block)
+
+        # Position builder at the end of body_block
+        self.current_builder.position_at_end(body_block)
+        # Generate IR for the statements in node.block
+        # Ensure node.block is a list for _generate_statement_list
+        block_stmts = node.block if isinstance(node.block, list) else [node.block]
+        self._generate_statement_list(block_stmts)
+
+        # If body_block is not terminated, add an unconditional branch to end_block
+        if not self.current_builder.block.is_terminated:
+            self.current_builder.branch(end_block)
+
+        # Position builder at the end of end_block
+        self.current_builder.position_at_end(end_block)
 
     def _generate_if_then_else(self, node: ast_nodes.IfThenElseStatementNode):
         # ... (implementation as before, using self.current_builder, self.current_llvm_function)
