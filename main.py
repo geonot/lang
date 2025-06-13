@@ -25,6 +25,7 @@ if __name__ == "__main__":
     test_coral_code = """
 object Point
   x // Field
+
   y // Field
 
   fn move(dx, dy) // Method
